@@ -301,7 +301,7 @@ class MarigoldTrainer:
 
                 # Predict the output
                 depth_pred = self.model.unet(
-                    unet_input, 1, text_embed
+                    unet_input, timesteps, text_embed
                 ).sample  # [B, 4, h, w]
                 if torch.isnan(depth_pred).any():
                     logging.warning("model_pred contains NaN.")
