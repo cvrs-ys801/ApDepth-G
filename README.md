@@ -4,38 +4,27 @@ This repository is based on [Marigold](https://marigoldmonodepth.github.io), CVP
 
 [![Website](doc/badges/badge-website.svg)](https://haruko386.github.io/research)
 [![License](https://img.shields.io/badge/License-Apache--2.0-929292)](https://www.apache.org/licenses/LICENSE-2.0)
-[![Static Badge](https://img.shields.io/badge/build-Haruko386-brightgreen?style=flat&logo=steam&logoColor=white&logoSize=auto&label=steam&labelColor=black&color=gray&cacheSeconds=3600)](https://steamcommunity.com/profiles/76561198217881431/)
 [![Hugging Face Model](https://img.shields.io/badge/🤗%20Hugging%20Face-Model-green)](https://huggingface.co/developy/ApDepth)
-[![Hugging Face Demo](https://img.shields.io/badge/🤗%20Hugging%20Face-Demo-purple)](https://huggingface.co/spaces/developy/ApDepth)
 
-[Haruko386](https://haruko386.github.io/),
+[**Jiawei Wang**](https://haruko386.github.io/),
 [Shuai Yuan](https://syjz.teacher.360eol.com/teacherBasic/preview?teacherId=23776)
+[Mingbo Lei](https://github.com/Ltohka)
 
-![cover](doc/cover.jpg)
+![cover](doc/cover.png)
 
->We present **ApDepth**, a diffusion model, and associated fine-tuning protocol for monocular depth estimation. Based on Marigold. Its core innovation lies in addressing the deficiency of diffusion models in feature representation capability. Our model followed Marigold, derived from Stable Diffusion and fine-tuned with synthetic data: Hypersim and VKitti, achieved ideal results in object edge refinement.
-
-## 📢 News
-- 2025-10-09: We propose a novel diffusion-based deep estimation framework guided by pre-trained models.
-- 2025-09-23: We change Marigold from **Stochastic multi-step generation** to **Deterministic one-step perception**
-- 2025-08-10: Trying to make some optimizations in Feature Expression<br>
-- 2025-05-08: Clone Marigold to local.<br>
-
-## 🚀 Usage
-
-**We offer several ways to interact with ApDepth**:
-
-1. A free online interactive demo is available here: <a href="https://huggingface.co/spaces/developy/ApDepth"><img src="https://img.shields.io/badge/🤗%20Hugging%20Face-Demo-purple" height="18"></a>
-
-2. If you just want to see the examples, visit our gallery: <a href="https://haruko386.github.io/research"><img src="doc/badges/badge-website.svg" height="16"></a>
-
-3. Local development instructions with this codebase are given below.
+> [!NOTE]
+>
+> This project follows the same training methodology as [**ApDepth**](https://github.com/cvrs-ys801/ApDepth) and serves as an extension of its content. It is provided for reference only.
 
 ## 🛠️ Setup
 
+The model was trained on:
+
+- Ubuntu 22.04 LTS, Python 3.12.9,  CUDA 11.8, GeForce RTX 6000 Ada Generation
+
 The inference code was tested on:
 
-- Ubuntu 22.04 LTS, Python 3.12.9,  CUDA 11.8, GeForce RTX 4090 & GeForce RTX 5080 (pip)
+- Ubuntu 22.04 LTS, Python 3.12.9,  CUDA 11.8, GeForce RTX 4090
 
 ### 🪧 A Note for Windows users
 
@@ -50,8 +39,8 @@ We recommend running the code in WSL2:
 Clone the repository (requires git):
 
 ```bash
-git clone https://github.com/Haruko386/ApDepth.git
-cd ApDepth
+git clone https://github.com/cvrs-ys801/ApDepth-G.git
+cd ApDepth-G
 ```
 
 ### 💻 Dependencies
@@ -91,7 +80,7 @@ You can find all results in `output/in-the-wild_example`. Enjoy!
 The default settings are optimized for the best result. However, the behavior of the code can be customized:
 
 - Trade-offs between the **accuracy** and **speed** (for both options, larger values result in better accuracy at the cost of slower inference.)
-  - `--ensemble_size`: Number of inference passes in the ensemble. For LCM `ensemble_size` is more important than `denoise_steps`. Default: ~~10~~ 5 (for LCM).
+  - `--ensemble_size`: Number of inference passes in the ensemble. For LCM `ensemble_size` is more important than `denoise_steps`. Default: 10
 
 - By default, the inference script resizes input images to the *processing resolution*, and then resizes the prediction back to the original resolution. This gives the best quality, as Stable Diffusion, from which Marigold is derived, performs best at 768x768 resolution.  
   
@@ -117,7 +106,7 @@ export HF_HOME=$(pwd)/cache
 Alternatively, use the following script to download the checkpoint weights locally:
 
 ```bash
-bash script/download_weights.sh marigold-v1-0
+bash script/download_weights.sh apdepth-G
 ```
 
 At inference, specify the checkpoint path:
@@ -125,7 +114,7 @@ At inference, specify the checkpoint path:
 ```bash
 python run.py \
     --checkpoint checkpoint/marigold-v1-0 \
-    --ensemble_size 1 \
+    --ensemble_size 10 \
     --input_rgb_dir input/in-the-wild_example\
     --output_dir output/in-the-wild_example
 ```
@@ -193,7 +182,11 @@ Evaluating results
 
 Only the U-Net is updated and saved during training. To use the inference pipeline with your training result, replace `unet` folder in Marigold checkpoints with that in the `checkpoint` output folder. Then refer to [this section](#evaluation) for evaluation.
 
-**Note**: Although random seeds have been set, the training result might be slightly different on different hardwares. It's recommended to train without interruption.
+> [!IMPORTANT]
+>
+> Although random seeds have been set, the training result might be slightly different on different hardwares. It's recommended to train without interruption.
+
+
 
 ## ✏️ Contributing
 
@@ -207,7 +200,7 @@ Please refer to [this](CONTRIBUTING.md) instruction.
 | (Windows) error on WSL: `Could not load library libcudnn_cnn_infer.so.8. Error: libcuda.so: cannot open shared object file: No such file or directory` | Run `export LD_LIBRARY_PATH=/usr/lib/wsl/lib:$LD_LIBRARY_PATH` |
 
 
-## 🎓 Citation
+<!-- ## 🎓 Citation
 Please cite our paper:
 
 ```bibtex
@@ -217,7 +210,7 @@ Please cite our paper:
       booktitle = {Under review},
       year={2026}
 }
-```
+``` -->
 
 ## 🎫 License
 
