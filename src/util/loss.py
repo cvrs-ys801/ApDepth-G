@@ -27,7 +27,6 @@ import torch.nn as nn
 
 
 def get_loss(loss_name, **kwargs):
-    # 添加参数安全检查
     safe_kwargs = kwargs if kwargs is not None else {}
     
     if "silog_mse" == loss_name:
@@ -47,7 +46,6 @@ def get_loss(loss_name, **kwargs):
         reduction = safe_kwargs.get('reduction', 'mean')
         criterion = HuberLoss(delta=delta, reduction=reduction)
     elif "mse_grad" == loss_name:
-        # 新增：均方 + 梯度损失
         grad_weight = safe_kwargs.get("grad_weight", 1.0)
         reduction = safe_kwargs.get("reduction", "mean")
         criterion = MSEGradLoss(grad_weight=grad_weight, reduction=reduction)
@@ -56,36 +54,41 @@ def get_loss(loss_name, **kwargs):
 
     return criterion
 
-def compute_normals_from_depth(depth_map, fx, fy, cx, cy):
-  """
-  从深度图计算表面法向量
-  (此处的代码与您提供的一致，无需更改)
-  """
-  batch_size, _, height, width = depth_map.shape
-  # ... (您提供的完整代码) ...
-  normals = torch.cross(d_points_dx, d_points_dy, dim=1)
-  normals = torch.nn.functional.normalize(normals, p=2, dim=1)
-  return normals
+class MultiScaleGradLoss(nn.Module):
+    def __init__(self, scales=4, weight=0.2):
+        super().__init__()
+        self.scales = scales
+        self.weight = weight
 
-class NormalLoss(nn.Module):
-  def __init__(self):
-      super(NormalLoss, self).__init__()
+    def forward(self, prediction, target, mask):
+        total = 0.0
+        mask = mask.float()
+        
+        for scale in range(self.scales):
+            step = pow(2, scale)
+            total += self._grad_loss(
+                prediction[:, :, ::step, ::step],
+                target[:, :, ::step, ::step],
+                mask[:, :, ::step, ::step]
+            )
+        return total * self.weight
 
-  def forward(self, pred_depth, gt_depth, fx, fy, cx, cy, mask=None):
-    """
-    计算法向量损失
-    (此处的代码与您提供的一致，无需更改)
-    """
-    # ... (您提供的完整代码) ...
-    pred_normals = compute_normals_from_depth(pred_depth, fx, fy, cx, cy)
-    gt_normals = compute_normals_from_depth(gt_depth, fx, fy, cx, cy)
-    cosine_sim = torch.sum(pred_normals * gt_normals, dim=1, keepdim=True)
-    loss = 1 - cosine_sim
-    if mask is not None:
-        loss = loss[mask].mean()
-    else:
-        loss = loss.mean()
-    return loss
+    def _grad_loss(self, prediction, target, mask):
+        M = torch.sum(mask, dim=(1, 2, 3)) + 1e-6
+        
+        diff = prediction - target
+        diff = torch.mul(mask, diff)
+        
+        grad_x = torch.abs(diff[:, :, :, 1:] - diff[:, :, :, :-1])
+        mask_x = torch.mul(mask[:, :, :, 1:], mask[:, :, :, :-1])
+        grad_x = torch.mul(mask_x, grad_x)
+
+        grad_y = torch.abs(diff[:, :, 1:, :] - diff[:, :, :-1, :])
+        mask_y = torch.mul(mask[:, :, 1:, :], mask[:, :, :-1, :])
+        grad_y = torch.mul(mask_y, grad_y)
+
+        image_loss = torch.sum(grad_x, dim=(1, 2, 3)) + torch.sum(grad_y, dim=(1, 2, 3))
+        return torch.mean(image_loss / M)
 
 class MSEGradLoss(nn.Module):
     def __init__(self, grad_weight=1.0, reduction="mean"):
@@ -127,9 +130,6 @@ class MSEGradLoss(nn.Module):
         gt = gt.float()
 
         if valid_mask is not None:
-            # valid_mask: boolean with same shape [B,C,H,W] or broadcastable
-            # mask out invalid elements before computing mse
-            # to avoid divide-by-zero, compute number of valid elements
             valid_mask_bool = valid_mask.bool()
             if valid_mask_bool.numel() == 0 or valid_mask_bool.sum() == 0:
                 # no valid pixels: return zero loss
@@ -145,21 +145,15 @@ class MSEGradLoss(nn.Module):
             else:
                 mse_term = mse
 
-            # 梯度损失：在 valid 区域对相邻像素都为 valid 的位置计算
-            # 计算 pred/gt 的梯度
             pred_gx, pred_gy = self._compute_gradients(pred)
             gt_gx, gt_gy = self._compute_gradients(gt)
 
-            # 构造对应的 valid mask for gradients（对应相邻对都为 valid）
-            # valid_mask shape: [B,C,H,W]
-            mask_x = valid_mask_bool[:, :, :, 1:] & valid_mask_bool[:, :, :, :-1]  # 对应 gx
-            mask_y = valid_mask_bool[:, :, 1:, :] & valid_mask_bool[:, :, :-1, :]  # 对应 gy
+            mask_x = valid_mask_bool[:, :, :, 1:] & valid_mask_bool[:, :, :, :-1]  # gx
+            mask_y = valid_mask_bool[:, :, 1:, :] & valid_mask_bool[:, :, :-1, :]  # gy
 
-            # 计算 L1 损失在 mask_x, mask_y 上
             gx_diff = torch.abs(pred_gx - gt_gx)
             gy_diff = torch.abs(pred_gy - gt_gy)
 
-            # 如果没有有效的 gradient mask，梯度项为零
             gx_valid = gx_diff[mask_x] if mask_x.sum() > 0 else torch.tensor(0.0, device=pred.device)
             gy_valid = gy_diff[mask_y] if mask_y.sum() > 0 else torch.tensor(0.0, device=pred.device)
 
