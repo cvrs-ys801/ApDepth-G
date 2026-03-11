@@ -23,10 +23,7 @@ import logging
 from typing import Dict, Optional, Union
 
 import numpy as np
-import cv2
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from diffusers import (
     AutoencoderKL,
     DDIMScheduler,
@@ -51,7 +48,6 @@ from .util.image_util import (
     resize_max_res,
 )
 from DA2.depth_anything_v2.dpt import DepthAnythingV2
-
 
 class MarigoldDepthOutput(BaseOutput):
     """
@@ -98,6 +94,12 @@ class MarigoldPipeline(DiffusionPipeline):
             A model property specifying whether the predicted depth maps are shift-invariant. This value must be set in
             the model config. When used together with the `scale_invariant=True` flag, the model is also called
             "affine-invariant". NB: overriding this value is not supported.
+        default_denoising_steps (`int`, *optional*):
+            The minimum number of denoising diffusion steps that are required to produce a prediction of reasonable
+            quality with the given model. This value must be set in the model config. When the pipeline is called
+            without explicitly setting `num_inference_steps`, the default value is used. This is required to ensure
+            reasonable results with various model flavors compatible with the pipeline, such as those relying on very
+            short denoising schedules (`LCMScheduler`) and those with full diffusion schedules (`DDIMScheduler`).
         default_processing_resolution (`int`, *optional*):
             The recommended value of the `processing_resolution` parameter of the pipeline. This value must be set in
             the model config. When the pipeline is called without explicitly setting `processing_resolution`, the
@@ -142,19 +144,16 @@ class MarigoldPipeline(DiffusionPipeline):
 
         self.empty_text_embed = None
 
-        self._fft_masks = {}
-        
         da2_config = {
-            'encoder': 'vits',  # 'vits', 'vitb', 'vitl', 'vitg'
-            'features': 64,
-            'out_channels': [48, 96, 192, 384],
+            'encoder':'vitl',
+            'features': 256,
+            'out_channels': [256, 512, 1024, 1024]
         }
-        
-        # 初始化 DA2 模型
+
         if da2_config is not None:
             self.da2 = DepthAnythingV2(**da2_config)
-            self.da2.load_state_dict(torch.load(f'/root/ApDepth/DA2/checkpoints/depth_anything_v2_{da2_config["encoder"]}.pth', map_location='cpu'))
-            self.da2.to(device="cuda").eval()
+            self.da2.load_state_dict(torch.load(f'DA2/checkpoints/depth_anything_v2_{da2_config["encoder"]}.pth', map_location='cpu'))
+            self.da2.to(device="cuda")
         else:
             self.da2 = None
 
@@ -168,6 +167,7 @@ class MarigoldPipeline(DiffusionPipeline):
         match_input_res: bool = True,
         resample_method: str = "bilinear",
         batch_size: int = 0,
+        generator: Union[torch.Generator, None] = None,
         color_map: str = "Spectral",
         show_progress_bar: bool = True,
         ensemble_kwargs: Dict = None,
@@ -265,7 +265,11 @@ class MarigoldPipeline(DiffusionPipeline):
         if batch_size > 0:
             _bs = batch_size
         else:
-            _bs = 1
+            _bs = find_batch_size(
+                ensemble_size=ensemble_size,
+                input_res=max(rgb_norm.shape[1:]),
+                dtype=self.dtype,
+            )
 
         single_rgb_loader = DataLoader(
             single_rgb_dataset, batch_size=_bs, shuffle=False
@@ -280,10 +284,11 @@ class MarigoldPipeline(DiffusionPipeline):
         else:
             iterable = single_rgb_loader
         for batch in iterable:
-            (batched_img,) = batch # here the image is still around 0-1
+            (batched_img,) = batch
             depth_pred_raw = self.single_infer(
                 rgb_in=batched_img,
                 num_inference_steps=denoising_steps,
+                show_pbar=show_progress_bar,
                 generator=generator,
             )
             depth_pred_ls.append(depth_pred_raw.detach())
@@ -338,6 +343,27 @@ class MarigoldPipeline(DiffusionPipeline):
             uncertainty=pred_uncert,
         )
 
+    def _check_inference_step(self, n_step: int) -> None:
+        """
+        Check if denoising step is reasonable
+        Args:
+            n_step (`int`): denoising steps
+        """
+        assert n_step >= 1
+
+        if isinstance(self.scheduler, DDIMScheduler):
+            if n_step < 10:
+                logging.warning(
+                    f"Too few denoising steps: {n_step}. Recommended to use the LCM checkpoint for few-step inference."
+                )
+        elif isinstance(self.scheduler, LCMScheduler):
+            if not 1 <= n_step <= 4:
+                logging.warning(
+                    f"Non-optimal setting of denoising steps: {n_step}. Recommended setting is 1-4 steps."
+                )
+        else:
+            raise RuntimeError(f"Unsupported scheduler type: {type(self.scheduler)}")
+
     def encode_empty_text(self):
         """
         Encode text embedding for empty prompt
@@ -359,6 +385,7 @@ class MarigoldPipeline(DiffusionPipeline):
         rgb_in: torch.Tensor,
         num_inference_steps: int,
         generator: Union[torch.Generator, None],
+        show_pbar: bool,
     ) -> torch.Tensor:
         """
         Perform an individual depth prediction without ensembling.
@@ -376,19 +403,17 @@ class MarigoldPipeline(DiffusionPipeline):
             `torch.Tensor`: Predicted depth map.
         """
         device = self.device
-        # preprare data
         rgb_in = rgb_in.to(device)
-        depth_da2 = self.da2.infer_batch(rgb_in).to(device)
+        da2_depth = self.da2.infer_batch(rgb_in).to(device)
 
         # Set timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps  # [T]
 
-        with torch.no_grad():
-            # Encode image
-            rgb_latent = self.encode_rgb(rgb_in)
-            depth_da2_latent = self.encode_rgb(depth_da2)
-        
+        # Encode image
+        rgb_latent = self.encode_rgb(rgb_in)
+        da2_depth_latent = self.encode_rgb(da2_depth)
+
         # Initial depth map (noise)
         depth_latent = torch.randn(
             rgb_latent.shape,
@@ -416,13 +441,13 @@ class MarigoldPipeline(DiffusionPipeline):
             iterable = enumerate(timesteps)
 
         for i, t in iterable:
-            # get input
             unet_input = torch.cat(
-                [depth_da2_latent, rgb_latent, depth_latent],dim=1
-            ) # this order is important
+                [rgb_latent, da2_depth_latent, depth_latent], dim=1
+            )  # this order is important
 
+            # predict the noise residual
             noise_pred = self.unet(
-                unet_input, 1, encoder_hidden_states=batch_empty_text_embed
+                unet_input, t, encoder_hidden_states=batch_empty_text_embed
             ).sample  # [B, 4, h, w]
 
             # compute the previous noisy sample x_t -> x_t-1

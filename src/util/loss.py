@@ -45,50 +45,9 @@ def get_loss(loss_name, **kwargs):
         delta = safe_kwargs.get('delta', 1.0)
         reduction = safe_kwargs.get('reduction', 'mean')
         criterion = HuberLoss(delta=delta, reduction=reduction)
-    elif "mse_grad" == loss_name:
-        grad_weight = safe_kwargs.get("grad_weight", 1.0)
-        reduction = safe_kwargs.get("reduction", "mean")
-        criterion = MSEGradLoss(grad_weight=grad_weight, reduction=reduction)
     else:
         raise NotImplementedError
-
     return criterion
-
-class MultiScaleGradLoss(nn.Module):
-    def __init__(self, scales=4, weight=0.2):
-        super().__init__()
-        self.scales = scales
-        self.weight = weight
-
-    def forward(self, prediction, target, mask):
-        total = 0.0
-        mask = mask.float()
-        
-        for scale in range(self.scales):
-            step = pow(2, scale)
-            total += self._grad_loss(
-                prediction[:, :, ::step, ::step],
-                target[:, :, ::step, ::step],
-                mask[:, :, ::step, ::step]
-            )
-        return total * self.weight
-
-    def _grad_loss(self, prediction, target, mask):
-        M = torch.sum(mask, dim=(1, 2, 3)) + 1e-6
-        
-        diff = prediction - target
-        diff = torch.mul(mask, diff)
-        
-        grad_x = torch.abs(diff[:, :, :, 1:] - diff[:, :, :, :-1])
-        mask_x = torch.mul(mask[:, :, :, 1:], mask[:, :, :, :-1])
-        grad_x = torch.mul(mask_x, grad_x)
-
-        grad_y = torch.abs(diff[:, :, 1:, :] - diff[:, :, :-1, :])
-        mask_y = torch.mul(mask[:, :, 1:, :], mask[:, :, :-1, :])
-        grad_y = torch.mul(mask_y, grad_y)
-
-        image_loss = torch.sum(grad_x, dim=(1, 2, 3)) + torch.sum(grad_y, dim=(1, 2, 3))
-        return torch.mean(image_loss / M)
 
 class MSEGradLoss(nn.Module):
     def __init__(self, grad_weight=1.0, reduction="mean"):

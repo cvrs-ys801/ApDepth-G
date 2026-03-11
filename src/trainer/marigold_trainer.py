@@ -37,8 +37,6 @@ from torch.nn.parameter import Parameter
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
-import torch.nn as nn
-import torch.nn.functional as F
 from tqdm import tqdm
 from PIL import Image
 
@@ -47,12 +45,12 @@ from src.util import metric
 from src.util.data_loader import skip_first_batches
 from src.util.logging_util import tb_logger, eval_dic_to_text
 from src.util.loss import get_loss
-from src.util.loss import MultiScaleGradLoss
 from src.util.lr_scheduler import IterExponential
 from src.util.metric import MetricTracker
 from src.util.multi_res_noise import multi_res_noise_like
 from src.util.alignment import align_depth_least_square
 from src.util.seeding import generate_seed_sequence
+
 
 class MarigoldTrainer:
     def __init__(
@@ -112,7 +110,6 @@ class MarigoldTrainer:
 
         # Loss
         self.loss = get_loss(loss_name=self.cfg.loss.name, **self.cfg.loss.kwargs)
-        self.multi_scale_grad_loss = MultiScaleGradLoss(scales=4, weight=0.2).to(self.device)
 
         # Training noise scheduler
         self.training_noise_scheduler: DDPMScheduler = DDPMScheduler.from_pretrained(
@@ -169,27 +166,51 @@ class MarigoldTrainer:
         self.in_evaluation = False
         self.global_seed_sequence: List = []  # consistent global seed sequence, used to seed random generator, to ensure consistency when resuming
 
+    # def _replace_unet_conv_in(self):
+    #     # replace the first layer to accept 8 in_channels
+    #     _weight = self.model.unet.conv_in.weight.clone()  # [320, 4, 3, 3]
+    #     _bias = self.model.unet.conv_in.bias.clone()  # [320]
+    #     _weight = _weight.repeat((1, 2, 1, 1))  # Keep selected channel(s)
+    #     # half the activation magnitude
+    #     _weight *= 0.5
+    #     # new conv_in channel
+    #     _n_convin_out_channel = self.model.unet.conv_in.out_channels
+    #     _new_conv_in = Conv2d(
+    #         8, _n_convin_out_channel, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)
+    #     )
+    #     _new_conv_in.weight = Parameter(_weight)
+    #     _new_conv_in.bias = Parameter(_bias)
+    #     self.model.unet.conv_in = _new_conv_in
+    #     logging.info("Unet conv_in layer is replaced")
+    #     # replace config
+    #     self.model.unet.config["in_channels"] = 8
+    #     logging.info("Unet config is updated")
+    #     return
+    
+    # 12 channels
     def _replace_unet_conv_in(self):
-        # replace the first layer to accept 8 in_channels
+        # replace the first layer to accept 12 in_channels
         _weight = self.model.unet.conv_in.weight.clone()  # [320, 4, 3, 3]
-        _bias = self.model.unet.conv_in.bias.clone()  # [320]
-        _weight = _weight.repeat((1, 2, 1, 1))  # Keep selected channel(s)
-        # half the activation magnitude
-        _weight *= 0.5
-        # new conv_in channel
+        _bias = self.model.unet.conv_in.bias.clone()      # [320]
+        _weight = _weight.repeat((1, 3, 1, 1))  
+
+        _weight *= (1.0 / 3.0)
+        
         _n_convin_out_channel = self.model.unet.conv_in.out_channels
         _new_conv_in = Conv2d(
-            8, _n_convin_out_channel, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)
+            12, _n_convin_out_channel, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)
         )
         _new_conv_in.weight = Parameter(_weight)
         _new_conv_in.bias = Parameter(_bias)
         self.model.unet.conv_in = _new_conv_in
-        logging.info("Unet conv_in layer is replaced")
+        
+        logging.info("Unet conv_in layer is replaced to accept 12 channels")
+        
         # replace config
-        self.model.unet.config["in_channels"] = 8
-        logging.info("Unet config is updated")
+        self.model.unet.config["in_channels"] = 12
+        logging.info("Unet config is updated to 12 channels")
         return
-    
+
     def train(self, t_end=None):
         logging.info("Start training")
 
@@ -204,7 +225,7 @@ class MarigoldTrainer:
 
         self.train_metrics.reset()
         accumulated_step = 0
-        
+
         for epoch in range(self.epoch, self.max_epoch + 1):
             self.epoch = epoch
             logging.debug(f"epoch: {self.epoch}")
@@ -222,11 +243,11 @@ class MarigoldTrainer:
                     rand_num_generator = None
 
                 # >>> With gradient accumulation >>>
+
                 # Get data
                 rgb = batch["rgb_norm"].to(device)
                 depth_gt_for_latent = batch[self.gt_depth_type].to(device)
-                # with torch.no_grad():
-                #     depth_da2 = self.model.da2.infer_batch(rgb)
+                da2_depth = self.model.da2.infer_batch(rgb).to(device)
 
                 if self.gt_mask_type is not None:
                     valid_mask_for_latent = batch[self.gt_mask_type].to(device)
@@ -239,16 +260,17 @@ class MarigoldTrainer:
                     raise NotImplementedError
 
                 batch_size = rgb.shape[0]
-                # 这里开始改动
+
                 with torch.no_grad():
                     # Encode image
                     rgb_latent = self.model.encode_rgb(rgb)  # [B, 4, h, w]
-                    # depth_da2_latent = self.model.encode_rgb(depth_da2) # [B, 4, h, w]
                     # Encode GT depth
                     gt_depth_latent = self.encode_depth(
                         depth_gt_for_latent
                     )  # [B, 4, h, w]
-                
+                    # Encode DA2 depth
+                    da2_depth_latent = self.model.encode_rgb(da2_depth)  # [B, 4, h, w]
+                # Sample a random timestep for each image
                 timesteps = torch.randint(
                     0,
                     self.scheduler_timesteps,
@@ -282,67 +304,47 @@ class MarigoldTrainer:
                     gt_depth_latent, noise, timesteps
                 )  # [B, 4, h, w]
 
-                # Text embedding (你是?)
+                # Text embedding
                 text_embed = self.empty_text_embed.to(device).repeat(
                     (batch_size, 1, 1)
                 )  # [B, 77, 1024]
 
-                unet_input = torch.cat(
-                    [rgb_latent, noisy_latents], dim=1
-                ) 
+                # Concat rgb and depth latents
+                cat_latents = torch.cat(
+                    [rgb_latent, da2_depth_latent, noisy_latents], dim=1
+                )  # [B, 12, h, w]
+                cat_latents = cat_latents.float()
 
-                # Predict the output
-                depth_pred = self.model.unet(
-                    unet_input, timesteps, text_embed
+                # Predict the noise residual
+                model_pred = self.model.unet(
+                    cat_latents, timesteps, text_embed
                 ).sample  # [B, 4, h, w]
-                if torch.isnan(depth_pred).any():
+                if torch.isnan(model_pred).any():
                     logging.warning("model_pred contains NaN.")
-
-                alpha_prod_t = self.training_noise_scheduler.alphas_cumprod[timesteps].to(device)
-                alpha_prod_t = alpha_prod_t.view(-1, 1, 1, 1) # reshape for broadcasting
-                beta_prod_t = 1 - alpha_prod_t
 
                 # Get the target for loss depending on the prediction type
                 if "sample" == self.prediction_type:
                     target = gt_depth_latent
-                    pred_x0 = depth_pred
                 elif "epsilon" == self.prediction_type:
                     target = noise
-                    pred_x0 = (noisy_latents - beta_prod_t ** 0.5 * depth_pred) / alpha_prod_t ** 0.5
                 elif "v_prediction" == self.prediction_type:
                     target = self.training_noise_scheduler.get_velocity(
                         gt_depth_latent, noise, timesteps
                     )  # [B, 4, h, w]
-                    pred_x0 = alpha_prod_t ** 0.5 * noisy_latents - beta_prod_t ** 0.5 * depth_pred
                 else:
                     raise ValueError(f"Unknown prediction type {self.prediction_type}")
 
-                # Masked latent loss (MSE loss)
+                # Masked latent loss
                 if self.gt_mask_type is not None:
                     latent_loss = self.loss(
-                        depth_pred[valid_mask_down].float(),
+                        model_pred[valid_mask_down].float(),
                         target[valid_mask_down].float(),
                     )
                 else:
-                    latent_loss = self.loss(depth_pred.float(), target.float())
+                    latent_loss = self.loss(model_pred.float(), target.float())
 
                 loss = latent_loss.mean()
 
-                if self.gt_mask_type is not None:
-                    grad_loss = self.multi_scale_grad_loss(
-                        pred_x0.float(), 
-                        gt_depth_latent.float(), 
-                        valid_mask_down
-                    )
-                else:
-                    dummy_mask = torch.ones_like(pred_x0, dtype=torch.bool, device=device)
-                    grad_loss = self.multi_scale_grad_loss(
-                        pred_x0.float(), 
-                        gt_depth_latent.float(), 
-                        dummy_mask
-                    )
-
-                loss += grad_loss
                 self.train_metrics.update("loss", loss.item())
 
                 loss = loss / self.gradient_accumulation_steps
