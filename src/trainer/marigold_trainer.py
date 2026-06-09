@@ -30,6 +30,7 @@ from typing import List, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from diffusers import DDPMScheduler
 from omegaconf import OmegaConf
 from torch.nn import Conv2d
@@ -82,8 +83,24 @@ class MarigoldTrainer:
         self.vis_loaders: List[DataLoader] = vis_dataloaders
         self.accumulation_steps: int = accumulation_steps
 
+        # Keep the model input strictly 12-channel:
+        #   RGB latent (4) + DA2 prior latent (4) + noisy depth latent (4).
+        # AFG is a mask-free regularizer/guidance term and does not add input channels.
+        self.unet_in_channels = 12
+
+        # Ambiguity-aware Far-field Geometry (AFG): automatically emphasizes far,
+        # low-texture regions such as sky without relying on an explicit sky mask.
+        self.afg_cfg = self.cfg.get("afg", {})
+        self.afg_enabled = bool(self.afg_cfg.get("enabled", True))
+        self.afg_far_is_larger = bool(self.afg_cfg.get("far_is_larger", True))
+        self.afg_far_gamma = float(self.afg_cfg.get("far_gamma", 2.0))
+        self.afg_texture_alpha = float(self.afg_cfg.get("texture_alpha", 8.0))
+        self.afg_smooth_weight = float(self.afg_cfg.get("smooth_weight", 0.03))
+        self.afg_anchor_weight = float(self.afg_cfg.get("anchor_weight", 0.02))
+        self.latent_grad_weight = float(self.afg_cfg.get("latent_grad_weight", 0.1))
+
         # Adapt input layers
-        if 8 != self.model.unet.config["in_channels"]:
+        if self.unet_in_channels != self.model.unet.config["in_channels"]:
             self._replace_unet_conv_in()
 
         # Encode empty text prompt
@@ -131,7 +148,7 @@ class MarigoldTrainer:
 
         # Eval metrics
         self.metric_funcs = [getattr(metric, _met) for _met in cfg.eval.eval_metrics]
-        self.train_metrics = MetricTracker(*["loss"])
+        self.train_metrics = MetricTracker(*["loss", "latent_loss", "grad_loss", "afg_loss"])
         self.val_metrics = MetricTracker(*[m.__name__ for m in self.metric_funcs])
         # main metric for best checkpoint saving
         self.main_val_metric = cfg.validation.main_val_metric
@@ -189,29 +206,120 @@ class MarigoldTrainer:
     #     logging.info("Unet config is updated")
     #     return
     
-    # 12 channels
     def _replace_unet_conv_in(self):
-        # replace the first layer to accept 12 in_channels
-        _weight = self.model.unet.conv_in.weight.clone()  # [320, 4, 3, 3]
+        # Replace the first layer to accept exactly 12 channels:
+        # RGB latent + DA2 prior latent + noisy depth latent.
+        _old_in_channels = self.model.unet.conv_in.in_channels
+        _new_in_channels = self.unet_in_channels
+        _weight = self.model.unet.conv_in.weight.clone()
         _bias = self.model.unet.conv_in.bias.clone()      # [320]
-        _weight = _weight.repeat((1, 3, 1, 1))  
 
-        _weight *= (1.0 / 3.0)
+        if _old_in_channels == _new_in_channels:
+            return
+        elif _old_in_channels == 4 and _new_in_channels == 12:
+            _weight = _weight.repeat((1, 3, 1, 1)) * (1.0 / 3.0)
+        elif _old_in_channels == 13 and _new_in_channels == 12:
+            # Allow loading an older sky-aware checkpoint by dropping the mask channel.
+            _weight = _weight[:, :12, :, :]
+        else:
+            raise ValueError(
+                f"Unsupported conv_in channel adaptation: {_old_in_channels} -> {_new_in_channels}"
+            )
         
         _n_convin_out_channel = self.model.unet.conv_in.out_channels
         _new_conv_in = Conv2d(
-            12, _n_convin_out_channel, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)
+            _new_in_channels, _n_convin_out_channel, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)
         )
         _new_conv_in.weight = Parameter(_weight)
         _new_conv_in.bias = Parameter(_bias)
         self.model.unet.conv_in = _new_conv_in
         
-        logging.info("Unet conv_in layer is replaced to accept 12 channels")
+        logging.info(f"Unet conv_in layer is replaced to accept {_new_in_channels} channels")
         
         # replace config
-        self.model.unet.config["in_channels"] = 12
-        logging.info("Unet config is updated to 12 channels")
+        self.model.unet.config["in_channels"] = _new_in_channels
+        logging.info(f"Unet config is updated to {_new_in_channels} channels")
         return
+
+    def _make_afg_mask(self, rgb, da2_depth, target_hw):
+        """Build a soft far-field ambiguity mask without explicit sky labels.
+
+        The mask is high where the DA2 prior predicts far regions and RGB texture is weak.
+        These regions usually include sky, horizon, distant roads/buildings, and other
+        visually ambiguous long-range structures.
+        """
+        eps = 1e-6
+        rgb_gray = rgb.detach().float().mean(dim=1, keepdim=True)
+        da2_gray = da2_depth.detach().float().mean(dim=1, keepdim=True)
+
+        # Low-texture score from RGB gradients. Sky/flat far areas receive high scores.
+        grad_x = torch.abs(rgb_gray[..., :, 1:] - rgb_gray[..., :, :-1])
+        grad_y = torch.abs(rgb_gray[..., 1:, :] - rgb_gray[..., :-1, :])
+        grad_x = F.pad(grad_x, (0, 1, 0, 0))
+        grad_y = F.pad(grad_y, (0, 0, 0, 1))
+        texture = grad_x + grad_y
+        tex_min = texture.flatten(1).amin(dim=1).view(-1, 1, 1, 1)
+        tex_max = texture.flatten(1).amax(dim=1).view(-1, 1, 1, 1)
+        texture_norm = (texture - tex_min) / (tex_max - tex_min + eps)
+        low_texture = torch.exp(-self.afg_texture_alpha * texture_norm)
+
+        # Far-region score from the DA2 prior. Direction is configurable because
+        # different DA2 wrappers may output depth or inverse-depth-like maps.
+        d_min = da2_gray.flatten(1).amin(dim=1).view(-1, 1, 1, 1)
+        d_max = da2_gray.flatten(1).amax(dim=1).view(-1, 1, 1, 1)
+        da2_norm = (da2_gray - d_min) / (d_max - d_min + eps)
+        far_score = da2_norm if self.afg_far_is_larger else (1.0 - da2_norm)
+        far_score = far_score.clamp(0.0, 1.0).pow(self.afg_far_gamma)
+
+        afg_mask = (far_score * low_texture).clamp(0.0, 1.0)
+        afg_mask = F.interpolate(
+            afg_mask,
+            size=target_hw,
+            mode="bilinear",
+            align_corners=False,
+        ).clamp(0.0, 1.0)
+        return afg_mask
+
+    @staticmethod
+    def _weighted_latent_smoothness(latent, mask):
+        eps = 1e-6
+        mask = mask.to(dtype=latent.dtype, device=latent.device)
+        if mask.shape[1] == 1 and latent.shape[1] != 1:
+            mask = mask.repeat(1, latent.shape[1], 1, 1)
+
+        dx = torch.abs(latent[..., :, 1:] - latent[..., :, :-1])
+        dy = torch.abs(latent[..., 1:, :] - latent[..., :-1, :])
+        mx = mask[..., :, 1:] * mask[..., :, :-1]
+        my = mask[..., 1:, :] * mask[..., :-1, :]
+
+        loss_x = (dx * mx).sum() / (mx.sum() + eps)
+        loss_y = (dy * my).sum() / (my.sum() + eps)
+        return loss_x + loss_y
+
+    @staticmethod
+    def _weighted_region_mean_l2(pred_latent, prior_latent, mask):
+        eps = 1e-6
+        mask = mask.to(dtype=pred_latent.dtype, device=pred_latent.device)
+        if mask.shape[1] == 1 and pred_latent.shape[1] != 1:
+            mask = mask.repeat(1, pred_latent.shape[1], 1, 1)
+
+        denom = mask.sum(dim=(-2, -1), keepdim=True) + eps
+        pred_mean = (pred_latent * mask).sum(dim=(-2, -1), keepdim=True) / denom
+        prior_mean = (prior_latent.detach() * mask).sum(dim=(-2, -1), keepdim=True) / denom
+        return torch.square(pred_mean - prior_mean).mean()
+
+    def _afg_regularization_loss(self, pred_x0, da2_depth_latent, rgb, da2_depth):
+        if not self.afg_enabled:
+            return pred_x0.new_tensor(0.0)
+
+        afg_mask = self._make_afg_mask(
+            rgb=rgb,
+            da2_depth=da2_depth,
+            target_hw=pred_x0.shape[-2:],
+        )
+        smooth_loss = self._weighted_latent_smoothness(pred_x0, afg_mask)
+        anchor_loss = self._weighted_region_mean_l2(pred_x0, da2_depth_latent, afg_mask)
+        return self.afg_smooth_weight * smooth_loss + self.afg_anchor_weight * anchor_loss
 
     def train(self, t_end=None):
         logging.info("Start training")
@@ -249,7 +357,8 @@ class MarigoldTrainer:
                 # Get data
                 rgb = batch["rgb_norm"].to(device)
                 depth_gt_for_latent = batch[self.gt_depth_type].to(device)
-                da2_depth = self.model.da2.infer_batch(rgb).to(device)
+                with torch.no_grad():
+                    da2_depth = self.model.da2.infer_batch(rgb).to(device)
 
                 if self.gt_mask_type is not None:
                     valid_mask_for_latent = batch[self.gt_mask_type].to(device)
@@ -270,7 +379,8 @@ class MarigoldTrainer:
                     gt_depth_latent = self.encode_depth(
                         depth_gt_for_latent
                     )  # [B, 4, h, w]
-                    # Encode DA2 depth
+                    # Encode DA2 depth prior. This stays as a normal 4-channel latent;
+                    # no sky mask or extra semantic channel is appended.
                     da2_depth_latent = self.model.encode_rgb(da2_depth)  # [B, 4, h, w]
                 
                 # Sample a random timestep for each image
@@ -318,11 +428,10 @@ class MarigoldTrainer:
                     (batch_size, 1, 1)
                 )  # [B, 77, 1024]
 
-                # Concat rgb and depth latents
+                # Concat RGB latent, DA2 prior latent, and noisy depth latent: 4 + 4 + 4 = 12 channels.
                 cat_latents = torch.cat(
                     [rgb_latent, da2_depth_latent, noisy_latents], dim=1
-                )  # [B, 12, h, w]
-                cat_latents = cat_latents.float()
+                ).float()
 
                 # Predict the noise residual
                 model_pred = self.model.unet(
@@ -379,9 +488,20 @@ class MarigoldTrainer:
                     latent_loss = unreduced_loss
                     grad_loss = self.latent_grad_loss(pred_x0.float(), gt_depth_latent.float())
 
-                loss = latent_loss.mean() + 0.1 * grad_loss.mean()
+                latent_loss = latent_loss.mean()
+                grad_loss = grad_loss.mean()
+                afg_loss = self._afg_regularization_loss(
+                    pred_x0=pred_x0.float(),
+                    da2_depth_latent=da2_depth_latent.float(),
+                    rgb=rgb.float(),
+                    da2_depth=da2_depth.float(),
+                )
+                loss = latent_loss + self.latent_grad_weight * grad_loss + afg_loss
 
                 self.train_metrics.update("loss", loss.item())
+                self.train_metrics.update("latent_loss", latent_loss.item())
+                self.train_metrics.update("grad_loss", grad_loss.item())
+                self.train_metrics.update("afg_loss", afg_loss.item())
 
                 loss = loss / self.gradient_accumulation_steps
                 loss.backward()
@@ -598,6 +718,10 @@ class MarigoldTrainer:
                 color_map=None,
                 show_progress_bar=False,
                 resample_method=self.cfg.validation.resample_method,
+                afg_guidance_weight=float(self.afg_cfg.get("guidance_weight", 0.03)),
+                afg_far_is_larger=self.afg_far_is_larger,
+                afg_far_gamma=self.afg_far_gamma,
+                afg_texture_alpha=self.afg_texture_alpha,
             )
 
             depth_pred: np.ndarray = pipe_out.depth_np

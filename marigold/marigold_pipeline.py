@@ -24,6 +24,7 @@ from typing import Dict, Optional, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from diffusers import (
     AutoencoderKL,
     DDIMScheduler,
@@ -145,9 +146,9 @@ class MarigoldPipeline(DiffusionPipeline):
         self.empty_text_embed = None
 
         da2_config = {
-            'encoder':'vitl',
-            'features': 256,
-            'out_channels': [256, 512, 1024, 1024]
+            'encoder':'vitg',
+            'features': 384,
+            'out_channels': [1536, 1536, 1536, 1536]
         }
 
         if da2_config is not None:
@@ -170,7 +171,13 @@ class MarigoldPipeline(DiffusionPipeline):
         generator: Union[torch.Generator, None] = None,
         color_map: str = "Spectral",
         show_progress_bar: bool = True,
+        sky_mask: Union[Image.Image, torch.Tensor, None] = None,  # deprecated; kept only for API compatibility
+        da2_sky_conf: float = 0.1,  # deprecated; no longer used in the 12-channel version
         ensemble_kwargs: Dict = None,
+        afg_guidance_weight: float = 0.03,
+        afg_far_is_larger: bool = True,
+        afg_far_gamma: float = 2.0,
+        afg_texture_alpha: float = 8.0,
     ) -> MarigoldDepthOutput:
         """
         Function invoked when calling the pipeline.
@@ -245,7 +252,7 @@ class MarigoldPipeline(DiffusionPipeline):
             4 == rgb.dim() and 3 == input_size[-3]
         ), f"Wrong input shape {input_size}, expected [1, rgb, H, W]"
 
-        # Resize image
+        # Resize image. The 12-channel version does not consume an explicit sky mask.
         if processing_res > 0:
             rgb = resize_max_res(
                 rgb,
@@ -290,6 +297,10 @@ class MarigoldPipeline(DiffusionPipeline):
                 num_inference_steps=denoising_steps,
                 show_pbar=show_progress_bar,
                 generator=generator,
+                afg_guidance_weight=afg_guidance_weight,
+                afg_far_is_larger=afg_far_is_larger,
+                afg_far_gamma=afg_far_gamma,
+                afg_texture_alpha=afg_texture_alpha,
             )
             depth_pred_ls.append(depth_pred_raw.detach())
         depth_preds = torch.concat(depth_pred_ls, dim=0)
@@ -379,6 +390,44 @@ class MarigoldPipeline(DiffusionPipeline):
         text_input_ids = text_inputs.input_ids.to(self.text_encoder.device)
         self.empty_text_embed = self.text_encoder(text_input_ids)[0].to(self.dtype)
 
+    @staticmethod
+    def _make_afg_mask(
+        rgb: torch.Tensor,
+        da2_depth: torch.Tensor,
+        target_hw,
+        far_is_larger: bool = True,
+        far_gamma: float = 2.0,
+        texture_alpha: float = 8.0,
+    ) -> torch.Tensor:
+        """Build a soft far-field ambiguity mask without explicit sky labels."""
+        eps = 1e-6
+        rgb_gray = rgb.detach().float().mean(dim=1, keepdim=True)
+        da2_gray = da2_depth.detach().float().mean(dim=1, keepdim=True)
+
+        grad_x = torch.abs(rgb_gray[..., :, 1:] - rgb_gray[..., :, :-1])
+        grad_y = torch.abs(rgb_gray[..., 1:, :] - rgb_gray[..., :-1, :])
+        grad_x = F.pad(grad_x, (0, 1, 0, 0))
+        grad_y = F.pad(grad_y, (0, 0, 0, 1))
+        texture = grad_x + grad_y
+        tex_min = texture.flatten(1).amin(dim=1).view(-1, 1, 1, 1)
+        tex_max = texture.flatten(1).amax(dim=1).view(-1, 1, 1, 1)
+        texture_norm = (texture - tex_min) / (tex_max - tex_min + eps)
+        low_texture = torch.exp(-float(texture_alpha) * texture_norm)
+
+        d_min = da2_gray.flatten(1).amin(dim=1).view(-1, 1, 1, 1)
+        d_max = da2_gray.flatten(1).amax(dim=1).view(-1, 1, 1, 1)
+        da2_norm = (da2_gray - d_min) / (d_max - d_min + eps)
+        far_score = da2_norm if far_is_larger else (1.0 - da2_norm)
+        far_score = far_score.clamp(0.0, 1.0).pow(float(far_gamma))
+
+        afg_mask = (far_score * low_texture).clamp(0.0, 1.0)
+        return F.interpolate(
+            afg_mask,
+            size=target_hw,
+            mode="bilinear",
+            align_corners=False,
+        ).clamp(0.0, 1.0)
+
     @torch.no_grad()
     def single_infer(
         self,
@@ -386,6 +435,10 @@ class MarigoldPipeline(DiffusionPipeline):
         num_inference_steps: int,
         generator: Union[torch.Generator, None],
         show_pbar: bool,
+        afg_guidance_weight: float = 0.03,
+        afg_far_is_larger: bool = True,
+        afg_far_gamma: float = 2.0,
+        afg_texture_alpha: float = 8.0,
     ) -> torch.Tensor:
         """
         Perform an individual depth prediction without ensembling.
@@ -410,9 +463,18 @@ class MarigoldPipeline(DiffusionPipeline):
         self.scheduler.set_timesteps(num_inference_steps, device=device)
         timesteps = self.scheduler.timesteps  # [T]
 
-        # Encode image
+        # Encode image and DA2 depth prior. No explicit sky mask is used;
+        # the input remains 12-channel inside the denoising loop.
         rgb_latent = self.encode_rgb(rgb_in)
         da2_depth_latent = self.encode_rgb(da2_depth)
+        afg_mask_down = self._make_afg_mask(
+            rgb=rgb_in,
+            da2_depth=da2_depth,
+            target_hw=rgb_latent.shape[-2:],
+            far_is_larger=afg_far_is_larger,
+            far_gamma=afg_far_gamma,
+            texture_alpha=afg_texture_alpha,
+        ).to(device=device, dtype=rgb_latent.dtype)
 
         # Initial depth map (noise)
         depth_latent = torch.randn(
@@ -443,7 +505,7 @@ class MarigoldPipeline(DiffusionPipeline):
         for i, t in iterable:
             unet_input = torch.cat(
                 [rgb_latent, da2_depth_latent, depth_latent], dim=1
-            )  # this order is important
+            )  # 4 + 4 + 4 = 12 channels; this order is important
 
             # predict the noise residual
             noise_pred = self.unet(
@@ -454,6 +516,15 @@ class MarigoldPipeline(DiffusionPipeline):
             depth_latent = self.scheduler.step(
                 noise_pred, t, depth_latent, generator=generator
             ).prev_sample
+
+            # AFG inference guidance: softly pulls only far, low-texture ambiguous
+            # regions toward the DA2 prior in late denoising steps. This suppresses
+            # sky-region local collapse while keeping the global 12-channel design.
+            if afg_guidance_weight > 0:
+                progress = float(i + 1) / max(float(len(timesteps)), 1.0)
+                step_weight = float(afg_guidance_weight) * (progress ** 2)
+                blend = (step_weight * afg_mask_down).clamp(0.0, 1.0)
+                depth_latent = depth_latent * (1.0 - blend) + da2_depth_latent * blend
 
         depth = self.decode_depth(depth_latent)
 

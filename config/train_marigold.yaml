@@ -27,9 +27,9 @@ augmentation:
   lr_flip_p: 0.5
 
 dataloader:
-  num_workers: 2
-  effective_batch_size: 32
-  max_train_batch_size: 2
+  num_workers: 12
+  effective_batch_size: 36
+  max_train_batch_size: 6
   seed: 2024  # to ensure continuity when resuming from checkpoint
 
 # Training settings
@@ -99,3 +99,17 @@ eval:
 
 normal_loss:
   weight: 0.5
+
+# Ambiguity-aware Far-field Geometry (AFG)
+# Keeps the UNet input strictly 12-channel and does not use explicit sky masks.
+# It builds a soft ambiguous far-region weight from DA2 prior + RGB low-texture cues,
+# then applies far-field smoothness, regional prior anchoring, and optional inference guidance.
+afg:
+  enabled: true
+  far_is_larger: true      # set false if your DA2 wrapper outputs inverse-depth-like maps
+  far_gamma: 2.0           # larger => focuses more strongly on the farthest DA2 regions
+  texture_alpha: 8.0       # larger => focuses more strongly on low-texture regions
+  smooth_weight: 0.03      # latent smoothness in far/low-texture regions
+  anchor_weight: 0.02      # regional mean anchor to DA2 prior, avoids local pseudo-texture copying
+  latent_grad_weight: 0.1  # existing latent gradient consistency weight
+  guidance_weight: 0.03    # inference-time weak far-field prior attraction; use 0.0 to disable
