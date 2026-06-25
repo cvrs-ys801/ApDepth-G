@@ -123,6 +123,20 @@ class MarigoldTrainer:
         self.vgc_smooth_weight = float(vgc_cfg.get("smooth_weight", 0.005))
         self.vgc_eps = float(vgc_cfg.get("eps", 1e-6))
 
+        # Horizon-Far Prior (HFP)
+        # A conservative add-on to VGC for sky-depth reversal cases. It only acts
+        # on invalid-depth pixels in the upper image region and softly pulls their
+        # latent response toward a far-depth pseudo target. It does not add any
+        # input channel or require sky segmentation.
+        hfp_cfg = self.cfg.get("horizon_far_prior", {})
+        self.hfp_enabled = bool(hfp_cfg.get("enabled", False))
+        self.hfp_start_iter = int(hfp_cfg.get("start_iter", 0))
+        self.hfp_top_ratio = float(hfp_cfg.get("top_ratio", 0.45))
+        self.hfp_min_invalid_ratio = float(hfp_cfg.get("min_invalid_ratio", 0.04))
+        self.hfp_weight = float(hfp_cfg.get("weight", 0.003))
+        self.hfp_far_depth_value = float(hfp_cfg.get("far_depth_value", 1.0))
+        self.hfp_eps = float(hfp_cfg.get("eps", 1e-6))
+
         # Training noise scheduler
         self.training_noise_scheduler: DDPMScheduler = DDPMScheduler.from_pretrained(
             os.path.join(
@@ -283,6 +297,18 @@ class MarigoldTrainer:
                     )  # [B, 4, h, w]
                     # Encode DA2 depth
                     da2_depth_latent = self.model.encode_rgb(da2_depth)  # [B, 4, h, w]
+
+                    # Encode a far-depth pseudo target only when HFP is enabled.
+                    # This is used as a weak target for invalid upper-image regions,
+                    # not as a replacement for ground-truth supervision.
+                    if self.hfp_enabled:
+                        far_depth = torch.full_like(
+                            depth_gt_for_latent,
+                            fill_value=self.hfp_far_depth_value,
+                        )
+                        far_depth_latent = self.encode_depth(far_depth).detach()
+                    else:
+                        far_depth_latent = None
                 
                 # Sample a random timestep for each image
                 timesteps = torch.randint(
@@ -403,6 +429,17 @@ class MarigoldTrainer:
                     )
                     loss = loss + vgc_loss
 
+                if self.hfp_enabled and self.effective_iter >= self.hfp_start_iter:
+                    # HFP is a very small correction for occasional sky-depth reversal:
+                    # only upper invalid regions are softly pulled toward a far-depth
+                    # pseudo target. It should be used as a late, weak regularizer.
+                    hfp_loss = self._horizon_far_prior_loss(
+                        pred_x0=pred_x0.float(),
+                        far_latent=far_depth_latent.float().detach(),
+                        invalid_mask=invalid_mask_down,
+                    )
+                    loss = loss + hfp_loss
+
                 self.train_metrics.update("loss", loss.item())
 
                 loss = loss / self.gradient_accumulation_steps
@@ -519,6 +556,51 @@ class MarigoldTrainer:
         smooth_loss = 0.5 * (smooth_x + smooth_y)
 
         return self.vgc_anchor_weight * anchor_loss + self.vgc_smooth_weight * smooth_loss
+
+    def _horizon_far_prior_loss(self, pred_x0, far_latent, invalid_mask):
+        """Softly regularize upper invalid regions toward far depth.
+
+        VGC prevents invalid regions from being completely unconstrained, but it
+        may still inherit ambiguous DA2 ordering in rare outdoor cases. HFP adds
+        a more explicit, conservative prior: invalid pixels near the top of the
+        image are likely to be sky / out-of-range and should not be decoded as
+        relatively close structures.
+
+        The loss is region-level rather than pixel-wise, so it avoids imposing
+        texture or sharp patterns on the sky. It also ignores samples whose upper
+        invalid area is too small.
+        """
+        if invalid_mask is None or far_latent is None:
+            return pred_x0.new_tensor(0.0)
+
+        invalid_mask = invalid_mask.to(device=pred_x0.device, dtype=pred_x0.dtype)
+        if invalid_mask.shape != pred_x0.shape:
+            invalid_mask = invalid_mask.expand_as(pred_x0)
+
+        b, c, h, w = pred_x0.shape
+        top_h = max(1, int(round(h * self.hfp_top_ratio)))
+        top_mask = pred_x0.new_zeros((1, 1, h, 1))
+        top_mask[:, :, :top_h, :] = 1.0
+
+        mask = invalid_mask * top_mask
+        upper_invalid_ratio = mask.flatten(1).mean(dim=1)  # [B]
+        sample_gate = (upper_invalid_ratio >= self.hfp_min_invalid_ratio).to(pred_x0.dtype)
+        if sample_gate.sum() <= 0:
+            return pred_x0.new_tensor(0.0)
+
+        sample_gate_4d = sample_gate.view(-1, 1, 1, 1)
+        mask = mask * sample_gate_4d
+        denom = mask.sum(dim=(2, 3), keepdim=True).clamp_min(self.hfp_eps)
+
+        # Region-level mean only: far prior should affect the coarse sky depth
+        # ordering, not copy high-frequency details into the prediction.
+        pred_mean = (pred_x0 * mask).sum(dim=(2, 3), keepdim=True) / denom
+        far_mean = (far_latent * mask).sum(dim=(2, 3), keepdim=True) / denom
+        loss = ((pred_mean - far_mean) ** 2 * sample_gate_4d).sum() / (
+            sample_gate.sum().clamp_min(self.hfp_eps) * c
+        )
+
+        return self.hfp_weight * loss
 
     def encode_depth(self, depth_in):
         # stack depth into 3-channel

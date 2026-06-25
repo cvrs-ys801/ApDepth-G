@@ -253,28 +253,6 @@ class SILogMSELoss:
         if self.batch_reduction:
             loss = loss.mean()
         return loss
-    
-# class HuberLoss:
-#     def __init__(self, delta=0.5):
-#         self.delta = delta
-        
-#     def __call__(self, depth_pred, depth_gt, valid_mask=None):
-#         # huber 损失
-#         # 计算预测值与真实值的差值
-#         diff = depth_gt - depth_pred
-        
-#         # 计算绝对值和差值的平方
-#         abs_diff = torch.abs(diff)
-#         squared_diff = diff ** 2
-        
-#         # 使用条件语句选择L2损失或L1损失
-#         loss = torch.where(abs_diff > self.delta, 0.5 * squared_diff, self.delta * abs_diff - 0.5 * self.delta ** 2)
-        
-#         # 返回所有样本损失的总和
-#         if valid_mask is not None:
-#             return torch.mean(loss[valid_mask])
-#         else:
-#             return torch.mean(loss)
 
 class HuberLoss(nn.Module):
     def __init__(self, delta=0.5, reduction='mean'):
@@ -283,21 +261,17 @@ class HuberLoss(nn.Module):
         self.reduction = reduction
         
     def forward(self, depth_pred, depth_gt, valid_mask=None):
-        # 计算预测值与真实值的差值
         diff = depth_gt - depth_pred
         
-        # 计算绝对差值
         abs_diff = torch.abs(diff)
         
-        # 当 |diff| <= delta 时，使用平方项
-        # 当 |diff| > delta 时，使用线性项
         loss = torch.where(
             abs_diff <= self.delta,
             0.5 * diff ** 2,
             self.delta * (abs_diff - 0.5 * self.delta)
         )
         
-        # 应用有效掩码（如果提供）
+
         if valid_mask is not None:
             loss = loss[valid_mask]
         

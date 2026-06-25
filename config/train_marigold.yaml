@@ -5,7 +5,6 @@ base_config:
 # - config/dataset/data_vkitti_val.yaml
 - config/dataset/dataset_train.yaml
 - config/dataset/dataset_val.yaml
-# 下面这个可视化可以不要
 # - config/dataset/dataset_vis.yaml
 - config/model_sdv2.yaml
 
@@ -61,7 +60,18 @@ validity_guided_completion:
   smooth_weight: 0.005
   eps: 1.0e-06
 
-# 建议这个数字不要再动
+# Horizon-Far Prior (HFP)
+# Small late-stage correction for occasional sky-depth reversal.
+# It only acts on invalid-depth pixels in the upper image region and keeps inference unchanged.
+horizon_far_prior:
+  enabled: true
+  start_iter: 3000
+  top_ratio: 0.45
+  min_invalid_ratio: 0.04
+  weight: 0.003
+  far_depth_value: 1.0
+  eps: 1.0e-06
+
 max_epoch: 10000  # a large enough number to ensure convergence
 max_iter: 23000 # usually converges at around 20k
 
