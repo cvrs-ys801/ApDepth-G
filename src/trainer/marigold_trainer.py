@@ -28,6 +28,7 @@ from typing import List, Union
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from diffusers import DDPMScheduler
 from omegaconf import OmegaConf
 from torch.nn import Conv2d
@@ -122,6 +123,41 @@ class MarigoldTrainer:
         self.vgc_anchor_weight = float(vgc_cfg.get("anchor_weight", 0.02))
         self.vgc_smooth_weight = float(vgc_cfg.get("smooth_weight", 0.005))
         self.vgc_eps = float(vgc_cfg.get("eps", 1e-6))
+
+        # Horizon-Far Prior (HFP)
+        # A conservative add-on to VGC for sky-depth reversal cases. It only acts
+        # on invalid-depth pixels in the upper image region and softly pulls their
+        # latent response toward a far-depth pseudo target. It does not add any
+        # input channel or require sky segmentation.
+        hfp_cfg = self.cfg.get("horizon_far_prior", {})
+        self.hfp_enabled = bool(hfp_cfg.get("enabled", False))
+        self.hfp_start_iter = int(hfp_cfg.get("start_iter", 0))
+        self.hfp_top_ratio = float(hfp_cfg.get("top_ratio", 0.45))
+        self.hfp_min_invalid_ratio = float(hfp_cfg.get("min_invalid_ratio", 0.04))
+        self.hfp_weight = float(hfp_cfg.get("weight", 0.003))
+        self.hfp_far_depth_value = float(hfp_cfg.get("far_depth_value", 1.0))
+        self.hfp_eps = float(hfp_cfg.get("eps", 1e-6))
+
+        # Sky-Foreground Ordinal Ranking (SFO)
+        # Training-only ordinal constraint for sky-depth reversal. Unlike HFP,
+        # SFO does not regress to an absolute far-depth latent. It decodes the
+        # predicted clean latent and only enforces a relative ordering: upper
+        # invalid / sky-like regions should be farther than lower valid foreground
+        # references. This keeps the correction scale-adaptive and dataset-safe.
+        sfo_cfg = self.cfg.get("sky_foreground_ordinal", {})
+        self.sfo_enabled = bool(sfo_cfg.get("enabled", False))
+        self.sfo_start_iter = int(sfo_cfg.get("start_iter", 0))
+        self.sfo_top_ratio = float(sfo_cfg.get("top_ratio", 0.45))
+        self.sfo_ref_start_ratio = float(sfo_cfg.get("ref_start_ratio", 0.55))
+        self.sfo_min_sky_ratio = float(sfo_cfg.get("min_sky_ratio", 0.015))
+        self.sfo_min_ref_ratio = float(sfo_cfg.get("min_ref_ratio", 0.05))
+        self.sfo_sky_tail_ratio = float(sfo_cfg.get("sky_tail_ratio", 0.30))
+        self.sfo_ref_tail_ratio = float(sfo_cfg.get("ref_tail_ratio", 0.30))
+        self.sfo_margin = float(sfo_cfg.get("margin", 0.08))
+        self.sfo_weight = float(sfo_cfg.get("weight", 0.01))
+        self.sfo_max_loss_ratio = float(sfo_cfg.get("max_loss_ratio", 0.08))
+        self.sfo_depth_far_is_larger = bool(sfo_cfg.get("depth_far_is_larger", True))
+        self.sfo_eps = float(sfo_cfg.get("eps", 1e-6))
 
         # Training noise scheduler
         self.training_noise_scheduler: DDPMScheduler = DDPMScheduler.from_pretrained(
@@ -283,6 +319,18 @@ class MarigoldTrainer:
                     )  # [B, 4, h, w]
                     # Encode DA2 depth
                     da2_depth_latent = self.model.encode_rgb(da2_depth)  # [B, 4, h, w]
+
+                    # Encode a far-depth pseudo target only when HFP is enabled.
+                    # This is used as a weak target for invalid upper-image regions,
+                    # not as a replacement for ground-truth supervision.
+                    if self.hfp_enabled:
+                        far_depth = torch.full_like(
+                            depth_gt_for_latent,
+                            fill_value=self.hfp_far_depth_value,
+                        )
+                        far_depth_latent = self.encode_depth(far_depth).detach()
+                    else:
+                        far_depth_latent = None
                 
                 # Sample a random timestep for each image
                 timesteps = torch.randint(
@@ -379,6 +427,8 @@ class MarigoldTrainer:
                 
                 unreduced_loss = unreduced_loss * snr_weight
 
+                torch.cuda.empty_cache()
+
                 if self.gt_mask_type is not None:
                     latent_loss = unreduced_loss[valid_mask_down]
                     grad_loss = self.latent_grad_loss(
@@ -390,7 +440,8 @@ class MarigoldTrainer:
                     latent_loss = unreduced_loss
                     grad_loss = self.latent_grad_loss(pred_x0.float(), gt_depth_latent.float())
 
-                loss = latent_loss.mean() + 0.1 * grad_loss.mean()
+                main_loss = latent_loss.mean() + 0.1 * grad_loss.mean()
+                loss = main_loss
 
                 if self.vgc_enabled:
                     # VGC only supervises invalid-depth regions. This prevents the
@@ -402,6 +453,35 @@ class MarigoldTrainer:
                         invalid_mask=invalid_mask_down,
                     )
                     loss = loss + vgc_loss
+
+                if self.hfp_enabled and self.effective_iter >= self.hfp_start_iter:
+                    # HFP is a very small correction for occasional sky-depth reversal:
+                    # only upper invalid regions are softly pulled toward a far-depth
+                    # pseudo target. It should be used as a late, weak regularizer.
+                    hfp_loss = self._horizon_far_prior_loss(
+                        pred_x0=pred_x0.float(),
+                        far_latent=far_depth_latent.float().detach(),
+                        invalid_mask=invalid_mask_down,
+                    )
+                    loss = loss + hfp_loss
+
+                if self.sfo_enabled and self.effective_iter >= self.sfo_start_iter:
+                    # SFO directly penalizes sky-near ordinal reversals in decoded
+                    # depth space. It is relative rather than absolute, so it does
+                    # not force all sky pixels to a fixed value and is less likely
+                    # to damage indoor / valid-depth supervision.
+                    sfo_loss = self._sky_foreground_ordinal_loss(
+                        pred_x0=pred_x0.float(),
+                        valid_mask=valid_mask_for_latent,
+                    )
+                    if self.sfo_max_loss_ratio > 0:
+                        sfo_loss = torch.minimum(
+                            sfo_loss,
+                            main_loss.detach() * self.sfo_max_loss_ratio,
+                        )
+                    loss = loss + sfo_loss
+                    
+                torch.cuda.empty_cache()
 
                 self.train_metrics.update("loss", loss.item())
 
@@ -519,6 +599,143 @@ class MarigoldTrainer:
         smooth_loss = 0.5 * (smooth_x + smooth_y)
 
         return self.vgc_anchor_weight * anchor_loss + self.vgc_smooth_weight * smooth_loss
+
+    def _horizon_far_prior_loss(self, pred_x0, far_latent, invalid_mask):
+        """Softly regularize upper invalid regions toward far depth.
+
+        VGC prevents invalid regions from being completely unconstrained, but it
+        may still inherit ambiguous DA2 ordering in rare outdoor cases. HFP adds
+        a more explicit, conservative prior: invalid pixels near the top of the
+        image are likely to be sky / out-of-range and should not be decoded as
+        relatively close structures.
+
+        The loss is region-level rather than pixel-wise, so it avoids imposing
+        texture or sharp patterns on the sky. It also ignores samples whose upper
+        invalid area is too small.
+        """
+        if invalid_mask is None or far_latent is None:
+            return pred_x0.new_tensor(0.0)
+
+        invalid_mask = invalid_mask.to(device=pred_x0.device, dtype=pred_x0.dtype)
+        if invalid_mask.shape != pred_x0.shape:
+            invalid_mask = invalid_mask.expand_as(pred_x0)
+
+        b, c, h, w = pred_x0.shape
+        top_h = max(1, int(round(h * self.hfp_top_ratio)))
+        top_mask = pred_x0.new_zeros((1, 1, h, 1))
+        top_mask[:, :, :top_h, :] = 1.0
+
+        mask = invalid_mask * top_mask
+        upper_invalid_ratio = mask.flatten(1).mean(dim=1)  # [B]
+        sample_gate = (upper_invalid_ratio >= self.hfp_min_invalid_ratio).to(pred_x0.dtype)
+        if sample_gate.sum() <= 0:
+            return pred_x0.new_tensor(0.0)
+
+        sample_gate_4d = sample_gate.view(-1, 1, 1, 1)
+        mask = mask * sample_gate_4d
+        denom = mask.sum(dim=(2, 3), keepdim=True).clamp_min(self.hfp_eps)
+
+        # Region-level mean only: far prior should affect the coarse sky depth
+        # ordering, not copy high-frequency details into the prediction.
+        pred_mean = (pred_x0 * mask).sum(dim=(2, 3), keepdim=True) / denom
+        far_mean = (far_latent * mask).sum(dim=(2, 3), keepdim=True) / denom
+        loss = ((pred_mean - far_mean) ** 2 * sample_gate_4d).sum() / (
+            sample_gate.sum().clamp_min(self.hfp_eps) * c
+        )
+
+        return self.hfp_weight * loss
+
+    def _sky_foreground_ordinal_loss(self, pred_x0, valid_mask):
+        """Relative sky-far ordinal loss in decoded depth space.
+
+        HFP may be too weak because VAE latent means are not guaranteed to be
+        linearly ordered by depth. SFO therefore decodes the predicted clean
+        latent back to a depth map and applies a hinge-ranking constraint:
+
+            upper invalid regions should be farther than lower valid foreground.
+
+        It does not require sky masks. The sky-like region is approximated by
+        upper-image invalid-depth pixels, while the foreground reference comes
+        from lower-image valid pixels. The loss is activated only when both
+        regions are sufficiently large, making it mostly inactive on NYU-style
+        indoor images where invalid regions are small.
+        """
+        if valid_mask is None:
+            return pred_x0.new_tensor(0.0)
+
+        # Decode clean latent to pixel-space normalized depth. The VAE weights are
+        # frozen, but gradients still flow from this loss to pred_x0 and UNet.
+        pred_depth = self.model.decode_depth(pred_x0)
+        pred_depth = torch.clamp(pred_depth, -1.0, 1.0)
+
+        if valid_mask.dim() == 3:
+            valid_mask = valid_mask.unsqueeze(1)
+        valid_mask = valid_mask.to(device=pred_depth.device)
+        if valid_mask.shape[-2:] != pred_depth.shape[-2:]:
+            valid_mask = F.interpolate(
+                valid_mask.float(),
+                size=pred_depth.shape[-2:],
+                mode="nearest",
+            ) > 0.5
+        else:
+            valid_mask = valid_mask.bool()
+
+        invalid_mask = ~valid_mask
+        b, _, h, w = pred_depth.shape
+
+        top_h = max(1, int(round(h * self.sfo_top_ratio)))
+        ref_y0 = min(h - 1, max(0, int(round(h * self.sfo_ref_start_ratio))))
+
+        top_mask = pred_depth.new_zeros((1, 1, h, w), dtype=torch.bool)
+        top_mask[:, :, :top_h, :] = True
+        ref_mask_region = pred_depth.new_zeros((1, 1, h, w), dtype=torch.bool)
+        ref_mask_region[:, :, ref_y0:, :] = True
+
+        sky_mask = invalid_mask & top_mask
+        ref_mask = valid_mask & ref_mask_region
+
+        # Convert to a unified far-score: larger score means farther away.
+        far_score = pred_depth if self.sfo_depth_far_is_larger else -pred_depth
+
+        losses = []
+        total_pixels = float(h * w)
+        for i in range(b):
+            sky_i = sky_mask[i, 0]
+            ref_i = ref_mask[i, 0]
+
+            sky_ratio = sky_i.float().mean()
+            ref_ratio = ref_i.float().mean()
+            if sky_ratio < self.sfo_min_sky_ratio or ref_ratio < self.sfo_min_ref_ratio:
+                continue
+
+            sky_values = far_score[i, 0][sky_i]
+            ref_values = far_score[i, 0][ref_i]
+            if sky_values.numel() < 4 or ref_values.numel() < 4:
+                continue
+
+            # Use the closest tail of the sky candidate as the violation target.
+            # This specifically attacks partial sky-near artifacts instead of only
+            # moving the whole sky mean.
+            sky_k = max(1, int(round(sky_values.numel() * self.sfo_sky_tail_ratio)))
+            ref_k = max(1, int(round(ref_values.numel() * self.sfo_ref_tail_ratio)))
+            sky_k = min(sky_k, sky_values.numel())
+            ref_k = min(ref_k, ref_values.numel())
+
+            sky_closest_far_score = torch.topk(
+                sky_values, k=sky_k, largest=False
+            ).values.mean()
+            ref_near_far_score = torch.topk(
+                ref_values, k=ref_k, largest=False
+            ).values.mean().detach()
+
+            # Enforce: sky far-score >= foreground near far-score + margin.
+            violation = ref_near_far_score + self.sfo_margin - sky_closest_far_score
+            losses.append(torch.relu(violation).pow(2))
+
+        if len(losses) == 0:
+            return pred_x0.new_tensor(0.0)
+
+        return self.sfo_weight * torch.stack(losses).mean()
 
     def encode_depth(self, depth_in):
         # stack depth into 3-channel

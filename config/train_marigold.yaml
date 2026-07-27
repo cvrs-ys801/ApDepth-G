@@ -28,7 +28,7 @@ augmentation:
 
 dataloader:
   num_workers: 6
-  effective_batch_size: 36
+  effective_batch_size: 42
   max_train_batch_size: 6
   seed: 2024  # to ensure continuity when resuming from checkpoint
 
